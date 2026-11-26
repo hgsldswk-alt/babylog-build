@@ -1,0 +1,325 @@
+import XCTest
+
+final class FlowUITests: XCTestCase {
+    private enum Language: String, CaseIterable {
+        case simplified = "zh-Hans"
+        case traditional = "zh-Hant"
+        case english = "en"
+        case japanese = "ja"
+
+        var locale: String {
+            switch self {
+            case .simplified: return "zh_CN"
+            case .traditional: return "zh_TW"
+            case .english: return "en_US"
+            case .japanese: return "ja_JP"
+            }
+        }
+    }
+
+    private var app: XCUIApplication!
+
+    override func setUp() {
+        continueAfterFailure = false
+        app = XCUIApplication()
+    }
+
+    private func launch(_ flags: [String] = [], language: Language = .simplified,
+                        reset: Bool = true, testCode: String? = nil) {
+        app.launchArguments = ["-ui-testing", "-AppleLanguages", "(\(language.rawValue))",
+                               "-AppleLocale", language.locale] + (reset ? ["-reset"] : []) + flags
+        app.launchEnvironment = testCode.map { ["BABYLOG_UI_CODE": $0] } ?? [:]
+        app.launch()
+    }
+
+    private func button(_ id: String) -> XCUIElement { app.buttons.matching(identifier: id).firstMatch }
+
+    private func tap(_ id: String, scroll: Bool = false, file: StaticString = #filePath, line: UInt = #line) {
+        let element = button(id)
+        if scroll {
+            for _ in 0..<3 where !element.exists || !element.isHittable { app.swipeUp() }
+            for _ in 0..<3 where !element.exists || !element.isHittable { app.swipeDown() }
+        }
+        XCTAssertTrue(element.waitForExistence(timeout: 8), id, file: file, line: line)
+        XCTAssertTrue(element.isHittable, id, file: file, line: line)
+        element.tap()
+    }
+
+    private func has(_ id: String) -> XCUIElement { app.descendants(matching: .any).matching(identifier: id).firstMatch }
+
+    private func tapSystemButton(_ labels: [String], dialog: Bool = false,
+                                 file: StaticString = #filePath, line: UInt = #line) {
+        let predicate = NSPredicate(format: "label IN %@", labels)
+        let query = (dialog ? app.sheets.buttons : app.buttons).matching(predicate)
+        let deadline = Date().addingTimeInterval(6)
+        while Date() < deadline {
+            if let visible = query.allElementsBoundByIndex.first(where: { $0.isHittable }) {
+                visible.tap()
+                return
+            }
+            if dialog, let visible = app.alerts.buttons.matching(predicate).allElementsBoundByIndex.first(where: { $0.isHittable }) {
+                visible.tap()
+                return
+            }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        }
+        if !dialog {
+            app.swipeDown(velocity: .fast)
+            return
+        }
+        XCTFail("System button unavailable: \(labels)", file: file, line: line)
+    }
+
+    private func replace(_ field: XCUIElement, with text: String) {
+        XCTAssertTrue(field.waitForExistence(timeout: 5))
+        field.tap()
+        if let value = field.value as? String, value != field.placeholderValue, !value.isEmpty {
+            field.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: value.count))
+        }
+        field.typeText(text)
+    }
+
+    func testFreshQuickFeedNursingAndUndo() {
+        launch(["-dark"])
+        XCTAssertTrue(has("home.empty").waitForExistence(timeout: 8))
+        XCTAssertFalse(app.alerts.firstMatch.exists)
+        button("home.preset.1").doubleTap()
+        XCTAssertTrue(has("home.saved").waitForExistence(timeout: 6))
+        XCTAssertTrue(button("home.record.0").exists)
+        XCTAssertFalse(button("home.record.1").exists)
+        tap("home.undo")
+        XCTAssertTrue(has("home.empty").waitForExistence(timeout: 6))
+        tap("home.nursing")
+        XCTAssertTrue(button("home.record.0").waitForExistence(timeout: 6))
+        XCTAssertFalse(button("home.record.1").exists)
+    }
+
+    func testAllDiaperTypesAndOtherAmountRetry() {
+        launch(["-fail-save"])
+        tap("home.other")
+        replace(app.textFields["editor.amount"], with: "90.5")
+        tap("editor.save")
+        XCTAssertTrue(has("feedback.error").waitForExistence(timeout: 5))
+        XCTAssertEqual(app.textFields["editor.amount"].value as? String, "90.5")
+        tap("editor.save")
+        XCTAssertTrue(has("home.saved").waitForExistence(timeout: 5))
+        for type in ["wet", "dirty", "both"] {
+            tap("home.diaper")
+            tap("diaper.\(type)")
+            XCTAssertTrue(button("sheet.done").waitForNonExistence(timeout: 5))
+        }
+        XCTAssertTrue(button("home.record.3").exists)
+    }
+
+    func testMomMedFirstEntryThenTwoTapRepeat() {
+        launch()
+        tap("home.mom", scroll: true)
+        replace(app.textFields["mom.name"], with: "Ibuprofen")
+        if app.keyboards.firstMatch.exists { app.typeText("\n") }
+        tap("mom.save")
+        XCTAssertTrue(has("home.lastMom").waitForExistence(timeout: 6))
+        tap("home.mom", scroll: true)
+        let chip = button("mom.recent.0")
+        XCTAssertTrue(chip.waitForExistence(timeout: 5))
+        XCTAssertTrue(chip.label.contains("Ibuprofen"))
+        chip.tap()
+        XCTAssertTrue(chip.waitForNonExistence(timeout: 5))
+        XCTAssertTrue(button("home.record.1").waitForExistence(timeout: 5))
+        XCTAssertFalse(button("home.record.2").exists)
+    }
+
+    func testDelayedSaveSurvivesBackgroundAndRelaunch() {
+        launch(["-slow-save"])
+        tap("home.preset.1")
+        XCUIDevice.shared.press(.home)
+        RunLoop.current.run(until: Date().addingTimeInterval(1.4))
+        app.activate()
+        XCTAssertTrue(button("home.record.0").waitForExistence(timeout: 6))
+        app.terminate()
+        launch(reset: false)
+        XCTAssertTrue(button("home.record.0").waitForExistence(timeout: 6))
+        XCTAssertFalse(button("home.record.1").exists)
+    }
+
+    func testBackfillYesterdayThenEditAndDelete() {
+        launch(["-demo", "-dark"])
+        tap("home.history", scroll: true)
+        tap("history.previous")
+        XCTAssertTrue(button("history.record.0").waitForExistence(timeout: 5))
+        tap("history.backfill")
+        tap("editor.kind.nursing")
+        tap("editor.save", scroll: true)
+        tap("history.record.4", scroll: true)
+        XCTAssertTrue(has("editor.side").waitForExistence(timeout: 5))
+        tap("editor.delete", scroll: true)
+        tapSystemButton(["删除", "刪除", "Delete"], dialog: true)
+        XCTAssertTrue(button("history.record.4").waitForNonExistence(timeout: 5))
+    }
+
+    func testHandoffAnonymitySelectionQRAndTextShare() {
+        launch(["-demo", "-two-babies", "-test-store-id", "-dark"])
+        tap("home.handoff")
+        XCTAssertTrue(has("share.privacy").waitForExistence(timeout: 6))
+        XCTAssertFalse(app.staticTexts["Lin"].isHittable)
+        XCTAssertFalse(has("share.qr").exists)
+        XCTAssertTrue(button("share.select").label.contains("4"))
+        tap("share.options")
+        let qrToggle = app.switches.matching(identifier: "share.addQR").firstMatch
+        XCTAssertTrue(qrToggle.waitForExistence(timeout: 5))
+        qrToggle.coordinate(withNormalizedOffset: CGVector(dx: 0.93, dy: 0.5)).tap()
+        XCTAssertTrue(has("share.qr").waitForExistence(timeout: 5))
+        tap("share.copyTags", scroll: true)
+        tap("share.select", scroll: true)
+        for i in 0..<4 { tap("share.record.\(i)", scroll: true) }
+        XCTAssertTrue(has("share.empty").exists)
+        XCTAssertFalse(button("share.image").isEnabled)
+        XCTAssertFalse(button("share.text").isEnabled)
+        tap("share.record.3")
+        tap("share.select", scroll: true)
+        tap("share.text", scroll: true)
+        tapSystemButton(["完成", "Done", "关闭", "關閉", "Close"])
+        XCTAssertTrue(has("share.privacy").waitForExistence(timeout: 5))
+    }
+
+    func testRenameAndImportMultilineCodeAfterPreview() {
+        launch(["-two-babies"], testCode: "\nBABY1/OZ/1.25-2-3-4\n")
+        tap("home.settings")
+        tap("settings.rename")
+        replace(app.textFields["profile.name"], with: "Ari")
+        tap("profile.save", scroll: true)
+        XCTAssertTrue(button("settings.baby.0").waitForExistence(timeout: 5))
+        XCTAssertTrue(button("settings.baby.0").label.contains("Ari"))
+        tap("settings.importCode", scroll: true)
+        tap("code.preview")
+        XCTAssertTrue(has("code.previewValues").waitForExistence(timeout: 5))
+        tap("code.apply")
+        XCTAssertTrue(button("settings.presets").waitForExistence(timeout: 5))
+        XCTAssertEqual(button("settings.presets").value as? String, "BABY1/OZ/1.25-2-3-4")
+    }
+
+    func testTrialExpiredOnlyPreventsNewProfiles() {
+        launch(["-expired", "-demo", "-two-babies"])
+        tap("home.switchBaby")
+        tapSystemButton(["Kai"])
+        tap("home.nursing")
+        XCTAssertTrue(has("home.saved").waitForExistence(timeout: 5))
+        tap("home.handoff")
+        XCTAssertTrue(button("share.text").isEnabled)
+        tap("sheet.done")
+        tap("home.history", scroll: true)
+        XCTAssertTrue(button("history.csv").exists)
+        app.navigationBars.buttons.element(boundBy: 0).tap()
+        tap("home.settings")
+        tap("settings.addBaby")
+        XCTAssertTrue(has("paywall.status").waitForExistence(timeout: 8))
+        XCTAssertFalse(button("paywall.trial").exists)
+        XCTAssertTrue(button("paywall.buy").exists)
+        tap("paywall.restore")
+        XCTAssertTrue(has("feedback.error").waitForExistence(timeout: 5))
+    }
+
+    func testFreeModeAndPurchasedModeCanAddProfiles() {
+        launch(["-free-mode"])
+        tap("home.settings")
+        XCTAssertFalse(button("settings.paywall").exists)
+        tap("settings.addBaby")
+        tap("profile.save")
+        XCTAssertTrue(button("settings.baby.1").waitForExistence(timeout: 5))
+
+        app.terminate()
+        launch(["-purchased"])
+        tap("home.settings")
+        tap("settings.addBaby")
+        tap("profile.save")
+        XCTAssertTrue(button("settings.baby.1").waitForExistence(timeout: 5))
+    }
+
+    func testSevenDayPublicCardAndLargeTypeCoreControl() {
+        launch(["-milestone", "-demo", "-dark"])
+        tap("home.history", scroll: true)
+        tap("history.milestone")
+        XCTAssertTrue(button("milestone.share").waitForExistence(timeout: 6))
+        XCTAssertFalse(app.staticTexts["Lin"].isHittable)
+        tap("sheet.done")
+        XCTAssertFalse(button("history.milestone").exists)
+
+        app.terminate()
+        launch(["-large-text"])
+        tap("home.preset.0", scroll: true)
+        XCTAssertTrue(has("home.saved").waitForExistence(timeout: 5))
+    }
+
+    func testStoreSimplifiedChinese() throws { try storeShots(.simplified) }
+    func testStoreTraditionalChinese() throws { try storeShots(.traditional) }
+    func testStoreEnglish() throws { try storeShots(.english) }
+    func testStoreJapanese() throws { try storeShots(.japanese) }
+
+    private func storeShots(_ language: Language) throws {
+        let prefix = "store-\(language.rawValue)-"
+        launch(["-demo", "-dark"], language: language)
+        XCTAssertTrue(button("home.preset.1").waitForExistence(timeout: 8))
+        try shot(prefix + "01-home-dark")
+        tap("home.preset.1")
+        XCTAssertTrue(has("home.saved").waitForExistence(timeout: 5))
+        try shot(prefix + "02-quick-log")
+        tap("home.diaper")
+        XCTAssertTrue(button("diaper.both").waitForExistence(timeout: 5))
+        try shot(prefix + "03-diaper")
+        tap("sheet.done")
+        tap("home.history", scroll: true)
+        tap("history.previous")
+        XCTAssertTrue(button("history.record.0").waitForExistence(timeout: 5))
+        try shot(prefix + "04-history")
+
+        app.terminate()
+        launch(["-demo", "-dark"], language: language)
+        tap("home.handoff")
+        XCTAssertTrue(has("share.privacy").waitForExistence(timeout: 5))
+        XCTAssertTrue(button("share.select").label.contains("4"))
+        try shot(prefix + "05-handoff")
+
+        app.terminate()
+        launch(["-demo", "-dark"], language: language)
+        let med = ["zh-Hans": "布洛芬", "zh-Hant": "布洛芬", "ja": "イブプロフェン"][language.rawValue] ?? "Ibuprofen"
+        tap("home.mom", scroll: true)
+        replace(app.textFields["mom.name"], with: med)
+        if app.keyboards.firstMatch.exists { app.typeText("\n") }
+        tap("mom.save")
+        XCTAssertTrue(has("home.lastMom").waitForExistence(timeout: 6))
+        tap("home.mom", scroll: true)
+        XCTAssertTrue(button("mom.recent.0").waitForExistence(timeout: 5))
+        try shot(prefix + "06-mom")
+    }
+
+    func testPaidScreenshotShowsTrialAndRestore() throws {
+        launch(["-paid-mode", "-paywall", "-dark"])
+        XCTAssertTrue(has("paywall.title").waitForExistence(timeout: 8))
+        XCTAssertTrue(button("paywall.trial").exists)
+        XCTAssertTrue(button("paywall.restore").exists)
+        try shot("paid-01-paywall")
+    }
+
+    func testNearExpiryShowsOneDay() {
+        launch(["-near-expiry", "-paywall"], language: .english)
+        let status = has("paywall.status")
+        XCTAssertTrue(status.waitForExistence(timeout: 8))
+        XCTAssertTrue(status.label.contains("left: 1,"))
+        XCTAssertTrue(button("paywall.trial").exists)
+    }
+
+    private func shot(_ name: String) throws {
+        let screenshot = app.screenshot()
+        let attachment = XCTAttachment(screenshot: screenshot)
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+
+        let environment = ProcessInfo.processInfo.environment
+        if let path = environment["SHOTS_DIR"] ?? environment["TEST_RUNNER_SHOTS_DIR"] {
+            let directory = URL(fileURLWithPath: path, isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try screenshot.pngRepresentation.write(to: directory.appendingPathComponent(name + ".png"))
+        }
+    }
+}
+
